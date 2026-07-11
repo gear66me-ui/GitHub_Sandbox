@@ -1,0 +1,150 @@
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if not np.isfinite(fps) or fps <= 0.0:
+        fps = 30.0
+    return {
+        "fps": fps,
+        "frame_count": frame_count,
+        "width": width,
+        "height": height,
+        "duration_s": frame_count / fps if frame_count > 0 else float("nan"),
+    }
+
+
+def process_video(config: Config) -> tuple[pd.DataFrame, dict[str, float]]:
+    if not config.input_video.exists():
+        raise FileNotFoundError(f"Input video not found: {config.input_video}")
+    cap = cv2.VideoCapture(str(config.input_video))
+    if not cap.isOpened():
+        raise RuntimeError(f"OpenCV could not open: {config.input_video}")
+    metadata = video_metadata(cap)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, config.start_frame)
+
+    records: list[FrameRecord] = []
+    solar_previous: Optional[CircleResult] = None
+    venus_history: list[CircleResult] = []
+    failures = 0
+    frame_index = config.start_frame
+    processed = 0
+
+    try:
+        while True:
+            if config.end_frame is not None and frame_index > config.end_frame:
+                break
+            if config.max_frames is not None and processed >= config.max_frames:
+                break
+            ok, frame = cap.read()
+            if not ok:
+                break
+            gray = to_gray(frame)
+
+            need_global = (
+                solar_previous is None
+                or processed % config.global_limb_retry == 0
+            )
+            try:
+                if need_global:
+                    solar_raw = detect_solar_limb_global(gray)
+                else:
+                    solar_raw = refine_solar_limb(
+                        gray, solar_previous, config.radial_samples
+                    )
+                solar = (
+                    solar_raw
+                    if solar_previous is None
+                    else smooth_circle(
+                        solar_previous, solar_raw, config.solar_smoothing
+                    )
+                )
+            except RuntimeError:
+                if solar_previous is None:
+                    raise
+                solar = CircleResult(
+                    solar_previous.cx,
+                    solar_previous.cy,
+                    solar_previous.radius,
+                    0.0,
+                    "SOLAR_FALLBACK_PREVIOUS",
+                )
+            solar_previous = solar
+
+            predicted = predict_venus(venus_history)
+            force_global = predicted is None or failures >= config.venus_reacquire_after
+            detected = False
+            source = "DETECTED"
+            try:
+                venus = detect_venus(
+                    gray, solar, predicted, config, force_global=force_global
+                )
+                detected = True
+                failures = 0
+                venus_history.append(venus)
+                venus_history = venus_history[-3:]
+            except RuntimeError:
+                failures += 1
+                if predicted is not None:
+                    venus = predicted
+                    venus.quality = 0.0
+                    venus.method = "PREDICTED_AFTER_FAILURE"
+                    source = "PREDICTED"
+                else:
+                    venus = CircleResult(
+                        np.nan, np.nan, np.nan, 0.0, "MISSING"
+                    )
+                    source = "MISSING"
+
+            pos_msec = float(cap.get(cv2.CAP_PROP_POS_MSEC))
+            time_s = (
+                pos_msec / 1000.0
+                if np.isfinite(pos_msec) and pos_msec >= 0.0
+                else frame_index / metadata["fps"]
+            )
+            records.append(
+                FrameRecord(
+                    frame_index=frame_index,
+                    time_s=time_s,
+                    solar_cx_px=solar.cx,
+                    solar_cy_px=solar.cy,
+                    solar_radius_px=solar.radius,
+                    solar_quality=solar.quality,
+                    solar_method=solar.method,
+                    venus_cx_px=venus.cx,
+                    venus_cy_px=venus.cy,
+                    venus_radius_px=venus.radius,
+                    venus_quality=venus.quality,
+                    venus_detected=detected,
+                    venus_source=source,
+                )
+            )
+            frame_index += 1
+            processed += 1
+    finally:
+        cap.release()
+
+    if not records:
+        raise RuntimeError("No video frames were processed.")
+    frame_table = pd.DataFrame([asdict(record) for record in records])
+    return frame_table, metadata
+
+
+def normalize_and_fill(frame_table: pd.DataFrame) -> pd.DataFrame:
+    table = frame_table.copy()
+    table["x_norm_raw"] = (
+        table["venus_cx_px"] - table["solar_cx_px"]
+    ) / table["solar_radius_px"]
+    table["y_norm_raw"] = (
+        table["solar_cy_px"] - table["venus_cy_px"]
+    ) / table["solar_radius_px"]
+    table["venus_radius_norm_raw"] = (
+        table["venus_radius_px"] / table["solar_radius_px"]
+    )
+
+    columns = [
+        "venus_cx_px",
+        "venus_cy_px",
+        "venus_radius_px",
+        "x_norm_raw",
+        "y_norm_raw",
+        "venus_radius_norm_raw",
+    ]

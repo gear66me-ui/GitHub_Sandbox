@@ -1,0 +1,150 @@
+        int(detected_indices[len(detected_indices) // 2])
+        if detected_indices.size
+        else len(table) // 2
+    )
+    row = table.iloc[representative_row]
+    frame_index = int(row["frame_index"])
+    frame = read_frame(config.input_video, frame_index)
+    gray = to_gray(frame)
+
+    solar_cx = float(row["solar_cx_px"])
+    solar_cy = float(row["solar_cy_px"])
+    solar_radius = float(row["solar_radius_px"])
+    x_overlay = solar_cx + table["x_norm"].to_numpy(dtype=float) * solar_radius
+    y_overlay = solar_cy - table["y_norm"].to_numpy(dtype=float) * solar_radius
+
+    figure, axis = plt.subplots(figsize=(8.0, 8.0), constrained_layout=True)
+    axis.imshow(gray, cmap="gray", origin="upper")
+    theta = np.linspace(0.0, 2.0 * np.pi, 1200)
+    axis.plot(
+        solar_cx + solar_radius * np.cos(theta),
+        solar_cy + solar_radius * np.sin(theta),
+        linewidth=0.65,
+        label="Recovered solar limb",
+    )
+    stride = max(1, len(table) // 900)
+    axis.plot(
+        x_overlay[::stride],
+        y_overlay[::stride],
+        linestyle="None",
+        marker=".",
+        markersize=1.5,
+        label="Frame-by-frame Venus centroid",
+    )
+
+    x_line_norm = np.linspace(
+        float(table["x_norm"].min()),
+        float(table["x_norm"].max()),
+        500,
+    )
+    y_line_norm = metrics.ols_slope * x_line_norm + metrics.ols_intercept
+    axis.plot(
+        solar_cx + x_line_norm * solar_radius,
+        solar_cy - y_line_norm * solar_radius,
+        linewidth=0.75,
+        label="Linear regression",
+    )
+
+    venus_cx = solar_cx + float(row["x_norm"]) * solar_radius
+    venus_cy = solar_cy - float(row["y_norm"]) * solar_radius
+    venus_radius = float(row["venus_radius_norm"]) * solar_radius
+    axis.plot(
+        venus_cx + venus_radius * np.cos(theta),
+        venus_cy + venus_radius * np.sin(theta),
+        linewidth=0.65,
+        label=f"Venus disk, frame {frame_index}",
+    )
+
+    margin = 1.05 * solar_radius
+    axis.set_xlim(solar_cx - margin, solar_cx + margin)
+    axis.set_ylim(solar_cy + margin, solar_cy - margin)
+    axis.set_aspect("equal", adjustable="box")
+    axis.set_xlabel("Image x [px]")
+    axis.set_ylabel("Image y [px]")
+    axis.set_title(
+        "NASA SDO 2012 Venus Transit Track\n"
+        f"TLS angle={metrics.track_angle_deg:.6f} deg | "
+        f"RMS={metrics.rms_perpendicular_norm:.8f} R_sun | "
+        f"curvature={metrics.curvature_norm_inverse:.8e} R_sun^-1"
+    )
+    axis.legend(loc="best", fontsize=7)
+    figure.savefig(output_path, dpi=300)
+    plt.close(figure)
+    return frame_index
+
+
+def metrics_table(
+    metrics: TrackMetrics, metadata: dict[str, float], overlay_frame: int
+) -> pd.DataFrame:
+    rows = [
+        ("version", VERSION, ""),
+        ("video_fps", metadata["fps"], "frame/s"),
+        ("video_frame_count_reported", metadata["frame_count"], "frame"),
+        ("video_width", metadata["width"], "px"),
+        ("video_height", metadata["height"], "px"),
+        ("processed_frame_count", metrics.total_count, "frame"),
+        ("detected_frame_count", metrics.detected_count, "frame"),
+        ("fit_frame_count", metrics.fit_count, "frame"),
+        (
+            "detection_fraction",
+            metrics.detected_count / max(metrics.total_count, 1),
+            "fraction",
+        ),
+        ("overlay_frame_index", overlay_frame, "frame"),
+        ("track_angle_tls", metrics.track_angle_deg, "deg"),
+        ("linear_slope_y_vs_x", metrics.ols_slope, ""),
+        ("linear_intercept_y_vs_x", metrics.ols_intercept, "R_sun"),
+        ("track_angle_ols", metrics.ols_angle_deg, "deg"),
+        ("rms_vertical", metrics.rms_vertical_norm, "R_sun"),
+        ("rms_perpendicular", metrics.rms_perpendicular_norm, "R_sun"),
+        ("quadratic_a", metrics.quadratic_a, "R_sun^-1"),
+        ("quadratic_b", metrics.quadratic_b, ""),
+        ("quadratic_c", metrics.quadratic_c, "R_sun"),
+        (
+            "curvature",
+            metrics.curvature_norm_inverse,
+            "R_sun^-1",
+        ),
+        ("curvature", metrics.curvature_px_inverse, "px^-1"),
+        ("curvature_fit_rms", metrics.curvature_rms_norm, "R_sun"),
+        ("median_solar_radius", metrics.median_solar_radius_px, "px"),
+        ("median_venus_radius", metrics.median_venus_radius_px, "px"),
+        (
+            "median_venus_radius_normalized",
+            metrics.median_venus_radius_norm,
+            "R_sun",
+        ),
+    ]
+    return pd.DataFrame(rows, columns=["metric", "value", "unit"])
+
+
+def save_xlsx(
+    table: pd.DataFrame,
+    metrics_df: pd.DataFrame,
+    output_path: Path,
+) -> None:
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        table.to_excel(writer, sheet_name="TRACK", index=False)
+        metrics_df.to_excel(writer, sheet_name="METRICS", index=False)
+        workbook = writer.book
+        track_sheet = workbook["TRACK"]
+        metrics_sheet = workbook["METRICS"]
+        for sheet in (track_sheet, metrics_sheet):
+            sheet.freeze_panes = "A2"
+            sheet.auto_filter.ref = sheet.dimensions
+            for cell in sheet[1]:
+                cell.font = cell.font.copy(bold=True)
+        for column_cells in track_sheet.columns:
+            header = str(column_cells[0].value)
+            width = min(
+                28,
+                max(
+                    len(header) + 2,
+                    max(
+                        len(str(cell.value)) if cell.value is not None else 0
+                        for cell in column_cells[1: min(track_sheet.max_row, 250) + 1]
+                    )
+                    + 1,
+                ),
+            )
+            track_sheet.column_dimensions[column_cells[0].column_letter].width = width

@@ -1,0 +1,150 @@
+# V0001
+# Audit reference: NASA SDO 2012 Venus Transit video extractor, complete source.
+from __future__ import annotations
+
+import argparse
+import math
+import sys
+from dataclasses import asdict, dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Iterable, Optional
+
+import cv2
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from scipy.optimize import least_squares
+
+
+VERSION = "V0001"
+DEFAULT_VIDEO = "NASA_SDO_2012_VENUS_TRANSIT.mp4"
+DEFAULT_OUTPUT_DIR = "NASA_SDO_2012_OUTPUT"
+CSV_NAME = "NASA_SDO_2012_TRACK.csv"
+XLSX_NAME = "NASA_SDO_2012_TRACK.xlsx"
+OVERLAY_NAME = "NASA_SDO_2012_TRACK_OVERLAY.png"
+
+
+@dataclass(frozen=True)
+class Config:
+    input_video: Path
+    output_dir: Path
+    start_frame: int = 0
+    end_frame: Optional[int] = None
+    max_frames: Optional[int] = None
+    radial_samples: int = 360
+    global_limb_retry: int = 90
+    solar_smoothing: float = 0.20
+    venus_inner_limit: float = 0.94
+    venus_radius_min_ratio: float = 0.010
+    venus_radius_max_ratio: float = 0.080
+    venus_search_ratio: float = 0.13
+    venus_reacquire_after: int = 8
+    min_venus_quality: float = 0.20
+
+
+@dataclass
+class CircleResult:
+    cx: float
+    cy: float
+    radius: float
+    quality: float
+    method: str
+
+
+@dataclass
+class FrameRecord:
+    frame_index: int
+    time_s: float
+    solar_cx_px: float
+    solar_cy_px: float
+    solar_radius_px: float
+    solar_quality: float
+    solar_method: str
+    venus_cx_px: float
+    venus_cy_px: float
+    venus_radius_px: float
+    venus_quality: float
+    venus_detected: bool
+    venus_source: str
+
+
+@dataclass
+class TrackMetrics:
+    fit_count: int
+    detected_count: int
+    total_count: int
+    tls_center_x_norm: float
+    tls_center_y_norm: float
+    tls_direction_x: float
+    tls_direction_y: float
+    track_angle_deg: float
+    ols_slope: float
+    ols_intercept: float
+    ols_angle_deg: float
+    rms_vertical_norm: float
+    rms_perpendicular_norm: float
+    quadratic_a: float
+    quadratic_b: float
+    quadratic_c: float
+    curvature_norm_inverse: float
+    curvature_px_inverse: float
+    curvature_rms_norm: float
+    median_solar_radius_px: float
+    median_venus_radius_px: float
+    median_venus_radius_norm: float
+
+
+def parse_args(argv: Optional[Iterable[str]] = None) -> Config:
+    parser = argparse.ArgumentParser(
+        description="Extract the 2012 Venus transit track from a NASA SDO MP4."
+    )
+    parser.add_argument("--input", default=DEFAULT_VIDEO, help="Input MP4 path.")
+    parser.add_argument(
+        "--output-dir",
+        default=DEFAULT_OUTPUT_DIR,
+        help="Output folder for CSV, XLSX, and overlay PNG.",
+    )
+    parser.add_argument("--start-frame", type=int, default=0)
+    parser.add_argument("--end-frame", type=int, default=None)
+    parser.add_argument("--max-frames", type=int, default=None)
+    parser.add_argument("--radial-samples", type=int, default=360)
+    parser.add_argument("--global-limb-retry", type=int, default=90)
+    args = parser.parse_args(argv)
+    return Config(
+        input_video=Path(args.input).expanduser().resolve(),
+        output_dir=Path(args.output_dir).expanduser().resolve(),
+        start_frame=max(0, args.start_frame),
+        end_frame=args.end_frame,
+        max_frames=args.max_frames,
+        radial_samples=max(120, args.radial_samples),
+        global_limb_retry=max(1, args.global_limb_retry),
+    )
+
+
+def to_gray(frame: np.ndarray) -> np.ndarray:
+    if frame.ndim == 2:
+        gray = frame
+    elif frame.shape[2] == 4:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGRA2GRAY)
+    else:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return gray.astype(np.float32)
+
+
+def robust_scale(values: np.ndarray) -> tuple[float, float]:
+    finite = np.asarray(values, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return 0.0, 1.0
+    median = float(np.median(finite))
+    mad = float(np.median(np.abs(finite - median)))
+    sigma = max(1.4826 * mad, 1.0e-9)
+    return median, sigma
+
+
+def algebraic_circle(points_xy: np.ndarray) -> tuple[float, float, float]:
+    points = np.asarray(points_xy, dtype=float)
+    if points.shape[0] < 3:
+        raise ValueError("At least three points are required for a circle.")
+    x = points[:, 0]

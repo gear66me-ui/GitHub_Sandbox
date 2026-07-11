@@ -1,0 +1,150 @@
+        gray,
+        map_x,
+        map_y,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REFLECT101,
+    )
+    profiles = cv2.GaussianBlur(profiles, (0, 0), sigmaX=1.0, sigmaY=0.0)
+    gradients = np.gradient(profiles.astype(float), axis=1)
+    indices = np.argmin(gradients, axis=1)
+    edge_strength = -gradients[np.arange(radial_samples), indices]
+    median_strength, sigma_strength = robust_scale(edge_strength)
+    keep = edge_strength > median_strength - 0.5 * sigma_strength
+    chosen_radii = radii[indices]
+    points = np.column_stack(
+        (
+            prior.cx + chosen_radii * np.cos(angles),
+            prior.cy + chosen_radii * np.sin(angles),
+        )
+    )
+    points = points[keep]
+    if points.shape[0] < max(40, radial_samples // 5):
+        raise RuntimeError("Solar limb refinement had too few edge points.")
+    circle = robust_circle(points)
+    edge_snr = float(
+        max(0.0, (np.median(edge_strength[keep]) - median_strength) / sigma_strength)
+    )
+    circle.quality = float(
+        np.clip(0.55 * circle.quality + 0.45 * math.tanh(edge_snr + 0.5), 0.0, 1.0)
+    )
+    circle.method = "RADIAL_GRADIENT"
+    return circle
+
+
+def smooth_circle(
+    previous: CircleResult, current: CircleResult, alpha: float
+) -> CircleResult:
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+    return CircleResult(
+        cx=(1.0 - alpha) * previous.cx + alpha * current.cx,
+        cy=(1.0 - alpha) * previous.cy + alpha * current.cy,
+        radius=(1.0 - alpha) * previous.radius + alpha * current.radius,
+        quality=current.quality,
+        method=current.method,
+    )
+
+
+def solar_mask(
+    shape: tuple[int, int], circle: CircleResult, radius_ratio: float
+) -> np.ndarray:
+    height, width = shape
+    yy, xx = np.ogrid[:height, :width]
+    return (
+        (xx - circle.cx) ** 2 + (yy - circle.cy) ** 2
+        <= (radius_ratio * circle.radius) ** 2
+    )
+
+
+def estimate_darkness(gray: np.ndarray, solar_radius: float) -> np.ndarray:
+    sigma = max(2.0, 0.030 * solar_radius)
+    background = cv2.GaussianBlur(
+        gray, (0, 0), sigmaX=sigma, sigmaY=sigma,
+        borderType=cv2.BORDER_REFLECT101
+    )
+    darkness = background.astype(np.float32) - gray.astype(np.float32)
+    darkness[darkness < 0.0] = 0.0
+    return darkness
+
+
+def component_circularity(mask: np.ndarray) -> float:
+    contours, _ = cv2.findContours(
+        mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
+    )
+    if not contours:
+        return 0.0
+    contour = max(contours, key=cv2.contourArea)
+    area = float(cv2.contourArea(contour))
+    perimeter = float(cv2.arcLength(contour, True))
+    if perimeter <= 0.0:
+        return 0.0
+    return float(np.clip(4.0 * np.pi * area / (perimeter * perimeter), 0.0, 1.0))
+
+
+def predict_venus(
+    history: list[CircleResult], frame_step: int = 1
+) -> Optional[CircleResult]:
+    if not history:
+        return None
+    if len(history) == 1:
+        last = history[-1]
+        return CircleResult(last.cx, last.cy, last.radius, last.quality, "PREDICT_HOLD")
+    first = history[-2]
+    last = history[-1]
+    return CircleResult(
+        cx=last.cx + frame_step * (last.cx - first.cx),
+        cy=last.cy + frame_step * (last.cy - first.cy),
+        radius=last.radius,
+        quality=last.quality,
+        method="PREDICT_VELOCITY",
+    )
+
+
+def candidate_components(
+    darkness: np.ndarray,
+    allowed_mask: np.ndarray,
+    solar: CircleResult,
+    predicted: Optional[CircleResult],
+    config: Config,
+) -> list[CircleResult]:
+    values = darkness[allowed_mask]
+    median, sigma = robust_scale(values)
+    percentile = 97.0 if predicted is None else 92.0
+    threshold = max(
+        median + (2.5 if predicted is None else 1.5) * sigma,
+        float(np.percentile(values, percentile)),
+    )
+    binary = np.zeros_like(darkness, dtype=np.uint8)
+    binary[(darkness >= threshold) & allowed_mask] = 255
+    kernel_radius = max(1, int(round(0.004 * solar.radius)))
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (2 * kernel_radius + 1, 2 * kernel_radius + 1)
+    )
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    count, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, 8)
+    min_radius = config.venus_radius_min_ratio * solar.radius
+    max_radius = config.venus_radius_max_ratio * solar.radius
+    results: list[CircleResult] = []
+
+    for label in range(1, count):
+        area = float(stats[label, cv2.CC_STAT_AREA])
+        equivalent_radius = math.sqrt(area / np.pi)
+        if not (0.45 * min_radius <= equivalent_radius <= 1.8 * max_radius):
+            continue
+        cx, cy = map(float, centroids[label])
+        local = labels == label
+        circularity = component_circularity(local)
+        mean_darkness = float(np.mean(darkness[local]))
+        darkness_z = (mean_darkness - median) / sigma
+        if predicted is None:
+            expected_radius = 0.035 * solar.radius
+            size_penalty = abs(math.log(max(equivalent_radius, 1.0) / expected_radius))
+            distance_penalty = 0.0
+        else:
+            size_penalty = abs(
+                math.log(max(equivalent_radius, 1.0) / max(predicted.radius, 1.0))
+            )
+            distance_penalty = (
+                math.hypot(cx - predicted.cx, cy - predicted.cy)
+                / max(config.venus_search_ratio * solar.radius, 1.0)
+            )
+        score = (

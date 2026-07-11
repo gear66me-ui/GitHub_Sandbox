@@ -1,0 +1,150 @@
+    invalid = ~table["venus_detected"].astype(bool)
+    table.loc[invalid, columns] = np.nan
+    for column in columns:
+        table[column] = (
+            table[column]
+            .interpolate(method="linear", limit_direction="both")
+            .ffill()
+            .bfill()
+        )
+    if table[columns].isna().any().any():
+        raise RuntimeError("Venus track could not be filled across every frame.")
+
+    table["x_norm"] = table["x_norm_raw"]
+    table["y_norm"] = table["y_norm_raw"]
+    table["venus_radius_norm"] = table["venus_radius_norm_raw"]
+    table["venus_source"] = np.where(
+        table["venus_detected"], "DETECTED", "INTERPOLATED"
+    )
+    return table
+
+
+def fit_track(table: pd.DataFrame) -> tuple[pd.DataFrame, TrackMetrics]:
+    detected = table["venus_detected"].to_numpy(dtype=bool)
+    quality = table["venus_quality"].to_numpy(dtype=float)
+    fit_mask = detected & np.isfinite(quality) & (quality >= 0.15)
+    if np.count_nonzero(fit_mask) < 5:
+        fit_mask = detected
+    if np.count_nonzero(fit_mask) < 5:
+        fit_mask = np.ones(len(table), dtype=bool)
+
+    x = table.loc[fit_mask, "x_norm"].to_numpy(dtype=float)
+    y = table.loc[fit_mask, "y_norm"].to_numpy(dtype=float)
+    points = np.column_stack((x, y))
+    center = np.mean(points, axis=0)
+    centered = points - center
+    _, _, vt = np.linalg.svd(centered, full_matrices=False)
+    direction = vt[0].astype(float)
+
+    first_point = table[["x_norm", "y_norm"]].iloc[0].to_numpy(dtype=float)
+    last_point = table[["x_norm", "y_norm"]].iloc[-1].to_numpy(dtype=float)
+    if np.dot(last_point - first_point, direction) < 0.0:
+        direction *= -1.0
+    direction /= np.linalg.norm(direction)
+    normal = np.array([-direction[1], direction[0]], dtype=float)
+
+    if np.ptp(x) <= 1.0e-12:
+        raise RuntimeError("Normalized x range is too small for y(x) regression.")
+    ols_slope, ols_intercept = np.polyfit(x, y, 1)
+    y_ols = ols_slope * x + ols_intercept
+    rms_vertical = float(np.sqrt(np.mean((y - y_ols) ** 2)))
+    perpendicular = centered @ normal
+    rms_perpendicular = float(np.sqrt(np.mean(perpendicular ** 2)))
+
+    along = centered @ direction
+    quadratic_a, quadratic_b, quadratic_c = np.polyfit(
+        along, perpendicular, 2
+    )
+    quadratic_fit = (
+        quadratic_a * along * along
+        + quadratic_b * along
+        + quadratic_c
+    )
+    curvature_rms = float(
+        np.sqrt(np.mean((perpendicular - quadratic_fit) ** 2))
+    )
+    curvature = float(
+        2.0 * quadratic_a
+        / (1.0 + quadratic_b * quadratic_b) ** 1.5
+    )
+
+    all_points = table[["x_norm", "y_norm"]].to_numpy(dtype=float)
+    all_centered = all_points - center
+    all_along = all_centered @ direction
+    all_perpendicular = all_centered @ normal
+    table = table.copy()
+    table["along_track_norm"] = all_along
+    table["cross_track_norm"] = all_perpendicular
+    table["x_fit_norm"] = table["x_norm"]
+    table["y_fit_norm"] = (
+        ols_slope * table["x_norm"] + ols_intercept
+    )
+    table["vertical_residual_norm"] = (
+        table["y_norm"] - table["y_fit_norm"]
+    )
+    table["quadratic_cross_track_fit_norm"] = (
+        quadratic_a * all_along * all_along
+        + quadratic_b * all_along
+        + quadratic_c
+    )
+    table["curvature_residual_norm"] = (
+        all_perpendicular - table["quadratic_cross_track_fit_norm"]
+    )
+
+    median_solar_radius = float(np.median(table["solar_radius_px"]))
+    median_venus_radius = float(np.median(table["venus_radius_px"]))
+    metrics = TrackMetrics(
+        fit_count=int(np.count_nonzero(fit_mask)),
+        detected_count=int(np.count_nonzero(detected)),
+        total_count=int(len(table)),
+        tls_center_x_norm=float(center[0]),
+        tls_center_y_norm=float(center[1]),
+        tls_direction_x=float(direction[0]),
+        tls_direction_y=float(direction[1]),
+        track_angle_deg=float(
+            np.degrees(np.arctan2(direction[1], direction[0]))
+        ),
+        ols_slope=float(ols_slope),
+        ols_intercept=float(ols_intercept),
+        ols_angle_deg=float(np.degrees(np.arctan(ols_slope))),
+        rms_vertical_norm=rms_vertical,
+        rms_perpendicular_norm=rms_perpendicular,
+        quadratic_a=float(quadratic_a),
+        quadratic_b=float(quadratic_b),
+        quadratic_c=float(quadratic_c),
+        curvature_norm_inverse=curvature,
+        curvature_px_inverse=float(curvature / median_solar_radius),
+        curvature_rms_norm=curvature_rms,
+        median_solar_radius_px=median_solar_radius,
+        median_venus_radius_px=median_venus_radius,
+        median_venus_radius_norm=float(
+            np.median(table["venus_radius_norm"])
+        ),
+    )
+    return table, metrics
+
+
+def read_frame(video_path: Path, frame_index: int) -> np.ndarray:
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not reopen video: {video_path}")
+    try:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+        ok, frame = cap.read()
+        if not ok:
+            raise RuntimeError(
+                f"Could not read overlay frame {frame_index}."
+            )
+        return frame
+    finally:
+        cap.release()
+
+
+def save_overlay(
+    config: Config,
+    table: pd.DataFrame,
+    metrics: TrackMetrics,
+    output_path: Path,
+) -> int:
+    detected_indices = table.index[table["venus_detected"]].to_numpy()
+    representative_row = (

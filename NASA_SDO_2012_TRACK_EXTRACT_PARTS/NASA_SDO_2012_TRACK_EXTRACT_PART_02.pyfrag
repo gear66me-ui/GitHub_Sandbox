@@ -1,0 +1,150 @@
+    y = points[:, 1]
+    design = np.column_stack((2.0 * x, 2.0 * y, np.ones_like(x)))
+    rhs = x * x + y * y
+    solution, *_ = np.linalg.lstsq(design, rhs, rcond=None)
+    cx, cy, c = solution
+    radius_sq = c + cx * cx + cy * cy
+    if radius_sq <= 0.0:
+        raise ValueError("Circle fit produced a non-positive radius.")
+    return float(cx), float(cy), float(math.sqrt(radius_sq))
+
+
+def robust_circle(points_xy: np.ndarray) -> CircleResult:
+    points = np.asarray(points_xy, dtype=float)
+    cx0, cy0, r0 = algebraic_circle(points)
+
+    def residuals(params: np.ndarray) -> np.ndarray:
+        cx, cy, radius = params
+        distances = np.hypot(points[:, 0] - cx, points[:, 1] - cy)
+        return distances - radius
+
+    result = least_squares(
+        residuals,
+        x0=np.array([cx0, cy0, r0], dtype=float),
+        loss="soft_l1",
+        f_scale=max(0.5, 0.002 * r0),
+        bounds=([-np.inf, -np.inf, 1.0], [np.inf, np.inf, np.inf]),
+        max_nfev=120,
+    )
+    cx, cy, radius = result.x
+    rms = float(np.sqrt(np.mean(residuals(result.x) ** 2)))
+    quality = float(1.0 / (1.0 + rms / max(radius, 1.0)))
+    return CircleResult(float(cx), float(cy), float(radius), quality, "ROBUST_CIRCLE")
+
+
+def sample_ring_mean(gray: np.ndarray, cx: float, cy: float, radius: float) -> float:
+    angles = np.linspace(0.0, 2.0 * np.pi, 720, endpoint=False)
+    map_x = (cx + radius * np.cos(angles)).astype(np.float32).reshape(1, -1)
+    map_y = (cy + radius * np.sin(angles)).astype(np.float32).reshape(1, -1)
+    values = cv2.remap(
+        gray, map_x, map_y, interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REFLECT101
+    )
+    return float(np.mean(values))
+
+
+def solar_candidate_score(
+    gray: np.ndarray, cx: float, cy: float, radius: float
+) -> float:
+    height, width = gray.shape
+    min_dim = float(min(height, width))
+    if not (0.20 * min_dim <= radius <= 0.58 * min_dim):
+        return -np.inf
+    center_distance = math.hypot(cx - 0.5 * width, cy - 0.5 * height)
+    if center_distance > 0.34 * min_dim:
+        return -np.inf
+    inside = sample_ring_mean(gray, cx, cy, 0.88 * radius)
+    limb_in = sample_ring_mean(gray, cx, cy, 0.98 * radius)
+    outside = sample_ring_mean(gray, cx, cy, 1.04 * radius)
+    _, sigma = robust_scale(gray)
+    brightness_term = (inside - outside) / sigma
+    edge_term = abs(limb_in - outside) / sigma
+    center_term = 1.0 - center_distance / (0.34 * min_dim)
+    return float(brightness_term + edge_term + 2.0 * center_term)
+
+
+def detect_solar_limb_global(gray: np.ndarray) -> CircleResult:
+    height, width = gray.shape
+    min_dim = min(height, width)
+    normalized = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    sigma = max(1.2, min_dim / 450.0)
+    blurred = cv2.GaussianBlur(normalized, (0, 0), sigma)
+    candidates: list[tuple[float, float, float, str]] = []
+
+    _, binary = cv2.threshold(
+        blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    )
+    kernel_size = max(3, int(round(min_dim * 0.015)) | 1)
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)
+    )
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    contours, _ = cv2.findContours(
+        binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
+    )
+    for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:5]:
+        if cv2.contourArea(contour) < 0.08 * height * width:
+            continue
+        points = contour[:, 0, :].astype(float)
+        try:
+            circle = robust_circle(points[:: max(1, len(points) // 1500)])
+            candidates.append((circle.cx, circle.cy, circle.radius, "CONTOUR"))
+        except (ValueError, np.linalg.LinAlgError):
+            continue
+
+    scale = min(1.0, 900.0 / max(height, width))
+    small = cv2.resize(
+        blurred, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA
+    )
+    hough = cv2.HoughCircles(
+        small,
+        cv2.HOUGH_GRADIENT,
+        dp=1.2,
+        minDist=max(20.0, 0.2 * min(small.shape)),
+        param1=80,
+        param2=35,
+        minRadius=int(0.20 * min(small.shape)),
+        maxRadius=int(0.58 * min(small.shape)),
+    )
+    if hough is not None:
+        for x_small, y_small, r_small in hough[0, :8]:
+            candidates.append(
+                (
+                    float(x_small / scale),
+                    float(y_small / scale),
+                    float(r_small / scale),
+                    "HOUGH",
+                )
+            )
+
+    if not candidates:
+        raise RuntimeError("Solar limb could not be initialized.")
+
+    scored = [
+        (solar_candidate_score(gray, cx, cy, radius), cx, cy, radius, method)
+        for cx, cy, radius, method in candidates
+    ]
+    score, cx, cy, radius, method = max(scored, key=lambda item: item[0])
+    refined = refine_solar_limb(
+        gray, CircleResult(cx, cy, radius, 0.0, method), radial_samples=720
+    )
+    refined.method = f"GLOBAL_{method}+{refined.method}"
+    refined.quality = float(max(refined.quality, 1.0 / (1.0 + math.exp(-score))))
+    return refined
+
+
+def refine_solar_limb(
+    gray: np.ndarray, prior: CircleResult, radial_samples: int
+) -> CircleResult:
+    angles = np.linspace(0.0, 2.0 * np.pi, radial_samples, endpoint=False)
+    radial_offsets = np.linspace(-0.09, 0.09, 91)
+    radii = prior.radius * (1.0 + radial_offsets)
+    map_x = (
+        prior.cx
+        + np.cos(angles)[:, None] * radii[None, :]
+    ).astype(np.float32)
+    map_y = (
+        prior.cy
+        + np.sin(angles)[:, None] * radii[None, :]
+    ).astype(np.float32)
+    profiles = cv2.remap(
